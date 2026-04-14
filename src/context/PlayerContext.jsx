@@ -332,36 +332,79 @@ async function fetchFromJamendo(clientId) {
 }
 
 /**
- * Free Music Archive API – truly open, CORS-friendly.
+ * Internet Archive – fetches real, verified MP3 URLs by querying the
+ * /metadata/ API for known Creative Commons audio collections.
+ * This avoids guessing filenames, which was causing 404/audio errors.
  */
-async function fetchFromFMA() {
-  const res = await fetch(
-    `https://freemusicarchive.org/api/get/tracks.json?api_key=60BLHNQCAOUFPIBZ&limit=50&sort=track_date_recorded&d=1`,
-    { signal: AbortSignal.timeout(8000) }
+async function fetchFromInternetArchive() {
+  // Well-known CC audio collections on Internet Archive with real MP3s
+  const collections = [
+    'audio_bookspoetry',
+    'opensource_audio',
+    'netlabels',
+    'GratefulDead',
+    'etree',
+  ];
+
+  // Pick one randomly so repeated loads feel fresh
+  const collection = collections[Math.floor(Math.random() * collections.length)];
+
+  const query = encodeURIComponent(
+    `collection:${collection} AND mediatype:audio AND format:MP3`
   );
-  if (!res.ok) throw new Error(`FMA HTTP ${res.status}`);
+  const searchUrl =
+    `https://archive.org/advancedsearch.php?q=${query}` +
+    `&fl[]=identifier,title,creator,subject,date` +
+    `&sort[]=downloads+desc&rows=12&page=1&output=json`;
 
-  const data = await res.json();
-  if (!data.dataset?.length) throw new Error('FMA no results');
+  const searchRes = await fetch(searchUrl, { signal: AbortSignal.timeout(10000) });
+  if (!searchRes.ok) throw new Error(`IA search HTTP ${searchRes.status}`);
 
-  return data.dataset
-    .filter((t) => t.track_file)
-    .slice(0, 40)
-    .map((t) => ({
-      id: String(t.track_id),
-      name: t.track_title || 'Untitled',
-      artist_name: t.artist_name || 'Unknown Artist',
-      album_name: t.album_title || 'Single',
-      audio: t.track_file,
-      image:
-        t.track_image_file ||
-        `https://picsum.photos/seed/fma${t.track_id}/300/300`,
-      duration: t.track_duration
-        ? parseInt(t.track_duration.split(':').reduce((acc, v, i, arr) =>
-            acc + parseInt(v) * Math.pow(60, arr.length - 1 - i), 0))
-        : 0,
-      genre: t.track_genres?.[0]?.genre_title || 'Various',
-    }));
+  const searchData = await searchRes.json();
+  const docs = searchData?.response?.docs;
+  if (!docs?.length) throw new Error('Internet Archive: no results');
+
+  // For each item, get its file manifest to find a real MP3 URL
+  const settled = await Promise.allSettled(
+    docs.slice(0, 12).map(async (doc) => {
+      const metaRes = await fetch(
+        `https://archive.org/metadata/${doc.identifier}/files`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (!metaRes.ok) throw new Error('meta fail');
+      const meta = await metaRes.json();
+
+      // Find the first MP3 file in the manifest
+      const mp3File = (meta.result || []).find(
+        (f) => f.format === 'VBR MP3' || f.name?.toLowerCase().endsWith('.mp3')
+      );
+      if (!mp3File) throw new Error('no mp3');
+
+      const subjectArr = Array.isArray(doc.subject) ? doc.subject : [doc.subject].filter(Boolean);
+      const genreKeywords = ['jazz', 'rock', 'electronic', 'classical', 'folk', 'pop', 'ambient', 'blues'];
+      const genre = subjectArr.find((s) =>
+        genreKeywords.some((g) => s?.toLowerCase?.().includes(g))
+      ) || 'Various';
+
+      return {
+        id: String(doc.identifier),
+        name: doc.title || mp3File.name?.replace('.mp3', '') || 'Untitled',
+        artist_name: doc.creator || 'Unknown Artist',
+        album_name: 'Internet Archive',
+        audio: `https://archive.org/download/${doc.identifier}/${encodeURIComponent(mp3File.name)}`,
+        image: `https://archive.org/services/img/${doc.identifier}`,
+        duration: mp3File.length ? Math.round(parseFloat(mp3File.length)) : 0,
+        genre: genre.charAt(0).toUpperCase() + genre.slice(1),
+      };
+    })
+  );
+
+  const tracks = settled
+    .filter((r) => r.status === 'fulfilled')
+    .map((r) => r.value);
+
+  if (tracks.length < 3) throw new Error(`Internet Archive: only ${tracks.length} tracks resolved`);
+  return tracks;
 }
 
 // ==========================================
@@ -401,13 +444,13 @@ export function PlayerProvider({ children }) {
       }
     }
 
-    // ── Source 2: Free Music Archive ──
+    // ── Source 2: Internet Archive (public-domain, no key required) ──
     if (!songs) {
       try {
-        songs = await fetchFromFMA();
-        console.info(`✅ Loaded ${songs.length} tracks from Free Music Archive`);
+        songs = await fetchFromInternetArchive();
+        console.info(`✅ Loaded ${songs.length} tracks from Internet Archive`);
       } catch (e) {
-        console.warn('FMA unavailable:', e.message);
+        console.warn('Internet Archive unavailable:', e.message);
       }
     }
 
